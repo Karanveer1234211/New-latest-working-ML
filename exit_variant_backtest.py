@@ -80,6 +80,56 @@ SL_MIN, SL_MAX = 2.0, 6.0
 BEAR_SL_TIGHTEN = 0.8
 
 RET_HOLD = "fwd_return_to_t5_close_pct"
+# In opportunities.py per_trade_v4: NAIVE_T1_OPEN rows carry the naive hold
+#   return in `fwd_return_to_t5_close_pct` (entry = T+1 open).
+# In ORB execution.py per_trade: EVERY variant row also carries a naive
+#   benchmark in `naive_fwd_t5_close_ret_pct` (+ naive_mae/mfe). When the
+#   NAIVE_T1_OPEN variant is absent we fall back to those columns so the
+#   HOLD baseline is still a true next-open-to-T5-close hold.
+NAIVE_HOLD_ALT = "naive_fwd_t5_close_ret_pct"
+
+
+def _select_universe(pt: pd.DataFrame, entry_variant: Optional[str]) -> pd.DataFrame:
+    """Pick the rows that define the signal universe + the HOLD baseline column.
+
+    Returns a frame guaranteed to have a `__hold_ret` column (naive open->T5
+    close hold) plus the TP/SL grid columns for the bracket exits.
+    """
+    variants = sorted(pt["variant"].unique())
+    # explicit override
+    if entry_variant:
+        sub = pt[pt["variant"] == entry_variant].copy()
+        if sub.empty:
+            raise SystemExit(f"No rows for entry variant {entry_variant!r}. "
+                             f"Available: {variants[:12]}")
+    elif "NAIVE_T1_OPEN" in variants:
+        sub = pt[pt["variant"] == "NAIVE_T1_OPEN"].copy()
+        entry_variant = "NAIVE_T1_OPEN"
+    elif NAIVE_HOLD_ALT in pt.columns:
+        # ORB execution.py schema: each variant carries the naive benchmark.
+        # Use ONE variant's rows as the signal universe (they share the same
+        # signals); pick the one with the most triggered rows for richest grid.
+        pick = (pt.groupby("variant")["triggered"].sum().sort_values(ascending=False).index[0]
+                if "triggered" in pt.columns else variants[0])
+        sub = pt[pt["variant"] == pick].copy()
+        entry_variant = f"{pick} (naive benchmark cols)"
+    else:
+        raise SystemExit("Cannot find a HOLD baseline. Need either a NAIVE_T1_OPEN "
+                         f"variant or a '{NAIVE_HOLD_ALT}' column. Variants: {variants[:12]}")
+
+    # Establish the HOLD baseline return column.
+    if "NAIVE_T1_OPEN" in str(entry_variant) and RET_HOLD in sub.columns and \
+            sub["variant"].iloc[0] == "NAIVE_T1_OPEN":
+        sub["__hold_ret"] = pd.to_numeric(sub[RET_HOLD], errors="coerce")
+        sub["__hold_basis"] = RET_HOLD
+    elif NAIVE_HOLD_ALT in sub.columns and sub[NAIVE_HOLD_ALT].notna().any():
+        sub["__hold_ret"] = pd.to_numeric(sub[NAIVE_HOLD_ALT], errors="coerce")
+        sub["__hold_basis"] = NAIVE_HOLD_ALT
+    else:
+        sub["__hold_ret"] = pd.to_numeric(sub[RET_HOLD], errors="coerce")
+        sub["__hold_basis"] = RET_HOLD
+    sub.attrs["entry_variant"] = entry_variant
+    return sub
 
 
 # -----------------------------------------------------------------------------
@@ -169,12 +219,45 @@ def bootstrap_sharpe_diff_ci(daily_a: pd.Series, daily_b: pd.Series,
 
 def add_strategy_returns(trades: pd.DataFrame, panel: Optional[pd.DataFrame]
                          ) -> Tuple[pd.DataFrame, List[str], Dict[str, str]]:
-    """Returns (df with *_ret cols, list of strategy names, name->ret_col map)."""
+    """Returns (df with *_ret cols, list of strategy names, name->ret_col map).
+
+    SCHEMA NOTE on what the TP/SL grid columns represent:
+      * opportunities.py per_trade_v4 + NAIVE_T1_OPEN universe -> the grid
+        `tp{n}_sl{m}_ret` IS the naive-open entry's bracket outcome, so
+        HOLD vs bracket is a clean same-entry comparison.
+      * ORB execution.py per_trade + an ORB variant universe -> the grid is the
+        ORB-ENTRY bracket while HOLD baseline is the naive-open benchmark
+        column. That mixes entries; for a pure exit study on that file, pass
+        --entry-variant NAIVE_T1_OPEN if present, else read the result as
+        'ORB-entry bracket vs naive-open hold' (still useful, just not a pure
+        exit isolation). The console prints which basis is in use.
+    """
     df = trades.copy()
     strat_cols: Dict[str, str] = {}
 
-    # Baseline: hold to T+5 close
-    df["HOLD_T5__ret"] = pd.to_numeric(df[RET_HOLD], errors="coerce")
+    # Detect whether the TP/SL grid is on the SAME entry as the hold baseline.
+    # NAIVE_T1_OPEN universe -> grid is the naive bracket (pure exit study).
+    # Otherwise (ORB-execution schema) the grid is the ORB-entry bracket and
+    # non-triggered rows have NO bracket outcome; we treat those as CASH (0)
+    # so every strategy spans the SAME universe (apples-to-apples), instead of
+    # silently comparing a 2.8k-trade bracket vs a 4.5k-trade hold.
+    same_entry = bool(str(trades.attrs.get("entry_variant", "")).startswith("NAIVE_T1_OPEN"))
+    if (not same_entry) and ("triggered" in df.columns):
+        cash_mask = ~df["triggered"].astype(bool).values
+        print(f"[schema] grid = ORB-entry bracket; {int(cash_mask.sum()):,} non-triggered "
+              f"rows -> CASH(0) so all strategies share one universe.")
+    else:
+        cash_mask = np.zeros(len(df), dtype=bool)
+
+    def _fill_cash(arr: np.ndarray) -> np.ndarray:
+        """Non-triggered rows (ORB schema) become 0; remaining NaN stay NaN."""
+        out = arr.copy()
+        out[cash_mask] = 0.0
+        return out
+
+    # Baseline: hold to T+5 close (naive open entry). `__hold_ret` is set by
+    # _select_universe to the correct column for either per-trade schema.
+    df["HOLD_T5__ret"] = pd.to_numeric(df["__hold_ret"], errors="coerce")
     strat_cols["HOLD_T5"] = "HOLD_T5__ret"
 
     # Fixed presets straight from the simulated grid
@@ -182,7 +265,7 @@ def add_strategy_returns(trades: pd.DataFrame, panel: Optional[pd.DataFrame]
         col = _col(tp, sl)
         if col in df.columns:
             name = f"FIXED_TP{tp:g}_SL{sl:g}"
-            df[f"{name}__ret"] = pd.to_numeric(df[col], errors="coerce")
+            df[f"{name}__ret"] = _fill_cash(pd.to_numeric(df[col], errors="coerce").values)
             strat_cols[name] = f"{name}__ret"
 
     # ATR-aware bracket (needs ATR% — join from panel if provided)
@@ -205,7 +288,8 @@ def add_strategy_returns(trades: pd.DataFrame, panel: Optional[pd.DataFrame]
                         continue
                     mask = (tp_snap.values == tp) & (sl_snap.values == sl)
                     atr_ret[mask] = pd.to_numeric(df[col], errors="coerce").values[mask]
-            # rows with no ATR fall back to hold
+            atr_ret = _fill_cash(atr_ret)
+            # rows with no ATR (same-entry schema) fall back to hold
             nofill = np.isnan(atr_ret)
             atr_ret[nofill] = df["HOLD_T5__ret"].values[nofill]
             df["ATR_BRACKET__ret"] = atr_ret
@@ -301,23 +385,25 @@ def main():
                     help="per_trade parquet from opportunities.py")
     ap.add_argument("--panel", type=Path, default=None,
                     help="panel_cache.parquet (enables ATR_BRACKET via D_atr14)")
-    ap.add_argument("--entry-variant", type=str, default="NAIVE_T1_OPEN",
-                    help="which entry variant defines the universe (default NAIVE_T1_OPEN)")
+    ap.add_argument("--entry-variant", type=str, default=None,
+                    help="entry variant that defines the universe. Default: auto "
+                         "(NAIVE_T1_OPEN if present, else the variant carrying the "
+                         "naive_* benchmark columns, e.g. ORB execution.py output).")
     ap.add_argument("--boot", type=int, default=1000, help="bootstrap resamples")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
     pt = pd.read_parquet(args.per_trade)
     pt["signal_date"] = pd.to_datetime(pt["signal_date"])
-    trades = pt[pt["variant"] == args.entry_variant].copy()
-    if trades.empty:
-        raise SystemExit(f"No rows for entry variant {args.entry_variant!r}. "
-                         f"Available: {sorted(pt['variant'].unique())[:10]}...")
+    trades = _select_universe(pt, args.entry_variant)
+    entry_label = trades.attrs.get("entry_variant", args.entry_variant)
+    hold_basis = trades["__hold_basis"].iloc[0] if "__hold_basis" in trades.columns else "?"
     print("=" * 78)
-    print(f"EXIT-VARIANT BACKTEST  |  entry = {args.entry_variant}")
+    print(f"EXIT-VARIANT BACKTEST  |  entry = {entry_label}")
     print("=" * 78)
     print(f"  universe : {len(trades):,} signals "
           f"({trades.signal_date.min().date()} -> {trades.signal_date.max().date()})")
+    print(f"  HOLD baseline column: {hold_basis}")
     buckets = sorted(trades['prob_bucket'].dropna().unique())
     print(f"  prob     : {trades.probability.min():.3f}..{trades.probability.max():.3f}  "
           f"buckets={buckets}")
